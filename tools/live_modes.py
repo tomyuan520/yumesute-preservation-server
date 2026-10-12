@@ -163,6 +163,8 @@ def install(app):
             async with app.acquire_db() as conn:
                 await conn.conn.execute('CREATE TABLE IF NOT EXISTS preservation_live_context ("userId" bigint PRIMARY KEY REFERENCES accounts("userId") ON DELETE CASCADE, mode text NOT NULL, "masterId" integer NOT NULL)')
                 await conn.conn.execute("ALTER TABLE preservation_live_context ADD COLUMN IF NOT EXISTS extra jsonb NOT NULL DEFAULT '{}'::jsonb")
+                # Upstream schema v4 (migrations are not run here): autoplay runs are not records.
+                await conn.conn.execute('ALTER TABLE active_live ADD COLUMN IF NOT EXISTS "isAutoPlay" boolean NOT NULL DEFAULT false')
                 await conn.conn.execute('CREATE TABLE IF NOT EXISTS preservation_course_run ("userId" bigint PRIMARY KEY REFERENCES accounts("userId") ON DELETE CASCADE, data jsonb NOT NULL)')
             yield
     app.router.lifespan_context = lifespan
