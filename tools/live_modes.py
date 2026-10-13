@@ -118,6 +118,45 @@ async def apply_progress(s, mode, ident, score, acts, cleared, result):
     for thing in sorted(things, key=lambda t:t[0]):
         result.audition_rewards.extend(await s.grant([thing]))
 
+RECORD_FIELDS = ('achievementRate', 'notationRate', 'clearLamp', 'rateGrade')
+NO_RECORD = dict(achievementRate=0.0, notationRate=0.0, clearLamp=0, rateGrade=0)
+
+async def record_snapshot(s, live_master_id):
+    """The records an autoplay finish must not change: the chart's Live row, song release
+    states and the player rate."""
+    live = await s.one('Live', liveMasterId=live_master_id)
+    profile = await s.one('UserProfile')
+    return dict(
+        live={k: live[k] for k in RECORD_FIELDS} if live else NO_RECORD,
+        music={r['id']: (r['stellaReleased'], r['olivierReleaseStatus']) for r in await s.rows('Music')},
+        rate=profile['playerRate'] if profile else None)
+
+async def restore_records(s, before, live_master_id, result):
+    """Undo what upstream recorded for an autoplay run. The client reports autoplayed notes
+    as PERFECT_STAR, so upstream would save a 101% All Perfect best. The play still counts
+    (timesCompleted, drops) and the result screen still shows this run."""
+    for name in ('Live', 'Music', 'UserProfile'):
+        s.tables.pop(name, None)  # upstream wrote these directly
+    live = await s.one('Live', liveMasterId=live_master_id)
+    if live:
+        await s.update('Live', live, **before['live'])
+    for row in await s.rows('Music'):
+        old = before['music'].get(row['id'])
+        if old and (row['stellaReleased'], row['olivierReleaseStatus']) != old:
+            await s.update('Music', row, stellaReleased=old[0], olivierReleaseStatus=old[1])
+    profile = await s.one('UserProfile')
+    if profile and before['rate'] is not None and profile['playerRate'] != before['rate']:
+        await s.update('UserProfile', profile, playerRate=before['rate'])
+    result.is_high_score = False
+    if result.rate_result:
+        result.rate_result.total_rate_after = result.rate_result.total_rate_before
+
+def played_total_rate(pairs):
+    """Upstream total_rate, skipping charts with no achievement. An autoplay on a new chart
+    leaves a 0% Live row, and live_rate still credits (level - 1) for 0%."""
+    from helpers.live_rate import total_rate
+    return total_rate((m, rate) for m, rate in pairs if rate > 0)
+
 @router.post('/api/Lives/FinishAndValidate')
 async def finish(request: Request):
     try:
@@ -127,9 +166,13 @@ async def finish(request: Request):
             active = await s.conn.conn.fetchrow('SELECT * FROM active_live WHERE "userId"=$1', s.uid)
             if not active: raise Rejected('No active live')
             context = await s.conn.conn.fetchrow('SELECT * FROM preservation_live_context WHERE "userId"=$1', s.uid)
+            auto = bool(context and (context['extra'] or {}).get('auto'))
+            before = await record_snapshot(s, active['liveMasterId']) if auto else None
             r = parts(await call_bound(request, s, upstream.lives_finish_and_validate))
             if r[0]: raise Rejected('Live validation failed')
             result = from_array('FinishLiveResult', r[1])
+            if before is not None:
+                await restore_records(s, before, active['liveMasterId'], result)
             if context:
                 score, cleared = play_totals(p)
                 if context['mode'] in ('concert','audition'):
@@ -163,11 +206,10 @@ def install(app):
             async with app.acquire_db() as conn:
                 await conn.conn.execute('CREATE TABLE IF NOT EXISTS preservation_live_context ("userId" bigint PRIMARY KEY REFERENCES accounts("userId") ON DELETE CASCADE, mode text NOT NULL, "masterId" integer NOT NULL)')
                 await conn.conn.execute("ALTER TABLE preservation_live_context ADD COLUMN IF NOT EXISTS extra jsonb NOT NULL DEFAULT '{}'::jsonb")
-                # Upstream schema v4 (migrations are not run here): autoplay runs are not records.
-                await conn.conn.execute('ALTER TABLE active_live ADD COLUMN IF NOT EXISTS "isAutoPlay" boolean NOT NULL DEFAULT false')
                 await conn.conn.execute('CREATE TABLE IF NOT EXISTS preservation_course_run ("userId" bigint PRIMARY KEY REFERENCES accounts("userId") ON DELETE CASCADE, data jsonb NOT NULL)')
             yield
     app.router.lifespan_context = lifespan
+    upstream.total_rate = played_total_rate
     count = len(app.router.routes)
     app.include_router(router)
     app.router.routes[:] = app.router.routes[count:] + app.router.routes[:count]
