@@ -39,6 +39,8 @@ def prepare(a):
         if (source/name).exists():shutil.copy2(source/name,dest/name)
     for src,dst in [(source/'assets',VENDOR/'_data/assets'),(source/'episodes',VENDOR/'_data/episodes'),(source/'scenes',dest/'scenes'),(source/'static-assets',PRIVATE/'static-assets')]:
         if src.is_dir():shutil.copytree(src,dst,dirs_exist_ok=True)
+    from supplemental_resources import install_resources
+    install_resources(source, ROOT, require_all=False)
     from helpers.mastermemory import unpack
     from helpers.msgpack import from_array
     from models.master_data import TABLES
@@ -48,7 +50,7 @@ def prepare(a):
         if name in TABLES:
             decoded=[from_array(TABLES[name].__name__,r).model_dump(mode='json',by_alias=True) for r in rows]
             (output/(name+'.json')).write_text(json.dumps(decoded,ensure_ascii=False),encoding='utf-8')
-    print('Prepared pinned backend and local master data. Start PostgreSQL, then import-account or fresh-account.')
+    print('Prepared pinned backend and local master data. Next: uv run --locked python server.py start')
     print('Missing optional media is not downloaded automatically. Run doctor to inspect local coverage.')
 
 def fresh_song_tickets():
@@ -122,12 +124,15 @@ async def account(a):
                 await conn.execute(add_hash_user_id(user['hashUserId'],uid))
             else:
                 await create_default_user_data(conn,uid,a.name)
+                from starter_music import grant_starter_music
+                await grant_starter_music(conn, uid)
                 if starter_tickets:
                     from helpers.things import grant_things_consolidated
                     await grant_things_consolidated(conn,uid,[(1,130001,starter_tickets)])
                 await conn.execute(add_hash_user_id(hash_id(uid),uid))
         restored=await user_data(app,uid)
         state,credentials=transfer_config(uid,'import' if raw else 'fresh',bridge)
+        if raw is None: state['accept_registration_name'] = True
         if raw:
             p=PRIVATE/'account-snapshot/user-data.response.bin';p.parent.mkdir(exist_ok=True);p.write_bytes(raw);p.chmod(0o600)
             write(PRIVATE/'imported-user-roundtrip.json',json.dumps(to_json(restored)))
@@ -145,8 +150,9 @@ def doctor(a):
     for p in required:
         ok=p.is_file();print(('OK      ' if ok else 'MISSING ')+str(p.relative_to(ROOT)));failed|=not ok
     for kind in ['2d-assets','3d-assets','cri-assets']:
-        p=VENDOR/'_data/assets'/kind/'ios/catalog.json'
-        print(('OK      ' if p.exists() else 'WARNING ')+f'{kind} iOS catalog')
+        for platform in ('iOS','Android'):
+            p=VENDOR/'_data/assets'/kind/platform.lower()/'catalog.json'
+            print(('OK      ' if p.exists() else 'WARNING ')+f'{kind} {platform} catalog')
     for label,p,glob in [('charts',VENDOR/'_data/assets/Notations','*.enc'),('scenes',PRIVATE/'upstream/scenes','*'),('static media',PRIVATE/'static-assets','*')]:
         print(f'{label}: {sum(x.is_file() for x in p.rglob(glob)) if p.exists() else 0} local files (count does not prove completeness)')
     if not failed:
@@ -161,8 +167,22 @@ def doctor(a):
         asyncio.run(check());print('OK      database account')
     if failed:raise RuntimeError('Setup incomplete; see README')
 
+def ensure_start_account():
+    if not (PRIVATE/'account.json').exists():
+        print('No account configured; creating a local Player starter save.')
+        asyncio.run(account(argparse.Namespace(command='fresh-account', name='Player')))
+
 def start(a):
+    from lifecycle import atomic_json, configuration, ensure_database
+    configuration(ROOT)  # Clear setup guidance before any account mutation.
+    saved_path = PRIVATE/'start-options.json'
+    saved = json.loads(saved_path.read_text()) if saved_path.exists() else {}
+    for key, default in [('port',8125), ('wg_port',51822), ('cert_port',8766)]:
+        setattr(a, key, getattr(a,key,None) or saved.get(key,default))
+    ensure_database(ROOT, getattr(a,'no_docker',False))
+    ensure_start_account()
     doctor(a)
+    atomic_json(saved_path, {key:getattr(a,key) for key in ('port','wg_port','cert_port')})
     env=dict(os.environ,YUMESUTE_PORT=str(a.port))
     logdir=ROOT/'logs';logdir.mkdir(exist_ok=True)
     with (logdir/'backend.log').open('a') as log:
@@ -190,13 +210,38 @@ def main():
     p=sub.add_parser('prepare');p.add_argument('--data-dir',required=True)
     p=sub.add_parser('import-account');p.add_argument('archive',type=Path)
     p=sub.add_parser('fresh-account');p.add_argument('--name',default='Player')
+    p=sub.add_parser('install-supplement');p.add_argument('--data-dir',required=True)
     sub.add_parser('doctor')
-    p=sub.add_parser('start');p.add_argument('--host');p.add_argument('--port',type=int,default=8125);p.add_argument('--wg-port',type=int,default=51822);p.add_argument('--cert-port',type=int,default=8766);p.add_argument('--no-browser',action='store_true')
+    def startup_options(p):
+        p.add_argument('--ca-dir',help='Reuse an existing local CA directory; saved for later starts')
+        p.add_argument('--host',help='LAN IPv4 override; otherwise detect the current address')
+        p.add_argument('--port',type=int);p.add_argument('--wg-port',type=int);p.add_argument('--cert-port',type=int)
+        p.add_argument('--no-browser',action='store_true')
+        p.add_argument('--no-docker',action='store_true',help='Require an already-running PostgreSQL service')
+    startup_options(sub.add_parser('start'))
+    p=sub.add_parser('setup');startup_options(p)
+    p.add_argument('--data-dir',default='data');p.add_argument('--skip-download',action='store_true')
+    p.add_argument('--platform',choices=('ios','android','both'),default='ios')
+    p.add_argument('--allow-missing',action='store_true',help='Explicitly accept incomplete media after reviewing download failures')
+    p=sub.add_parser('repair-data');p.add_argument('--data-dir',default='data')
+    p.add_argument('--platform',choices=('ios','android','both'),default='ios')
+    p.add_argument('--allow-missing',action='store_true',help='Install verified files even when other media is unavailable')
+    p=sub.add_parser('backup');p.add_argument('--output',required=True,help='New private .zip file; existing files are never overwritten')
     a=parser.parse_args();PRIVATE.mkdir(exist_ok=True,mode=0o700)
-    if a.command=='prepare':prepare(a)
-    elif a.command in ('import-account','fresh-account'):asyncio.run(account(a))
-    elif a.command=='doctor':doctor(a)
-    else:start(a)
+    from lifecycle import installation_lock, setup, repair, backup
+    if a.command=='doctor':
+        doctor(a);return
+    with installation_lock(ROOT):
+        if a.command=='prepare':prepare(a)
+        elif a.command in ('import-account','fresh-account'):asyncio.run(account(a))
+        elif a.command=='install-supplement':
+            from supplemental_resources import install_resources
+            count=install_resources(Path(a.data_dir).expanduser().resolve(),ROOT)
+            print(f'Installed {count} verified supplemental resources. Accounts and configuration unchanged.')
+        elif a.command=='setup':setup(ROOT,a,sys.modules[__name__])
+        elif a.command=='repair-data':repair(ROOT,a)
+        elif a.command=='backup':backup(ROOT,a)
+        else:start(a)
 
 if __name__=='__main__':
     try:main()
